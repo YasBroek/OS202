@@ -4,6 +4,9 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <numeric>
+#include <vector>
+#include <omp.h>
 
 #include "model.hpp"
 #include "display.hpp"
@@ -202,14 +205,69 @@ int main( int nargs, char* args[] )
     auto simu = Model( params.length, params.discretization, params.wind,
                        params.start);
     SDL_Event event;
-    while (simu.update())
+    
+    // Timing variables
+    std::vector<double> update_times;
+    std::vector<double> display_times;
+    
+    while (true)
     {
+        // Measure model update time
+        auto update_start = std::chrono::high_resolution_clock::now();
+        bool updated = simu.update();
+        auto update_end = std::chrono::high_resolution_clock::now();
+        
+        if (!updated) break;
+        
+        double update_duration = std::chrono::duration<double, std::milli>(update_end - update_start).count();
+        update_times.push_back(update_duration);
+        
         if ((simu.time_step() & 31) == 0) 
             std::cout << "Time step " << simu.time_step() << "\n===============" << std::endl;
+        
+        // Measure display update time
+        auto display_start = std::chrono::high_resolution_clock::now();
         displayer->update( simu.vegetal_map(), simu.fire_map() );
+        auto display_end = std::chrono::high_resolution_clock::now();
+        
+        double display_duration = std::chrono::duration<double, std::milli>(display_end - display_start).count();
+        display_times.push_back(display_duration);
+        
+        // Print timing information periodically
+        if ((simu.time_step() & 31) == 0) {
+            double avg_update_time = std::accumulate(update_times.end() - std::min(static_cast<size_t>(32), update_times.size()), 
+                                                    update_times.end(), 0.0) / 
+                                    std::min(static_cast<size_t>(32), update_times.size());
+            
+            double avg_display_time = std::accumulate(display_times.end() - std::min(static_cast<size_t>(32), display_times.size()), 
+                                                     display_times.end(), 0.0) / 
+                                     std::min(static_cast<size_t>(32), display_times.size());
+            
+            std::cout << "Average update time: " << avg_update_time << " ms" << std::endl;
+            std::cout << "Average display time: " << avg_display_time << " ms" << std::endl;
+            std::cout << "Total step time: " << avg_update_time + avg_display_time << " ms" << std::endl;
+        }
+        
         if (SDL_PollEvent(&event) && event.type == SDL_QUIT)
             break;
-        std::this_thread::sleep_for(0.1s);
+        //std::this_thread::sleep_for(0.1s);
     }
+    
+    // Calculate and display final statistics
+    if (!update_times.empty() && !display_times.empty()) {
+        double total_update_time = std::accumulate(update_times.begin(), update_times.end(), 0.0);
+        double total_display_time = std::accumulate(display_times.begin(), display_times.end(), 0.0);
+        
+        double avg_update_time = total_update_time / update_times.size();
+        double avg_display_time = total_display_time / display_times.size();
+        
+        std::cout << "\n===== FINAL TIMING STATISTICS =====" << std::endl;
+        std::cout << "Total time steps: " << update_times.size() << std::endl;
+        std::cout << "Average model update time: " << avg_update_time << " ms" << std::endl;
+        std::cout << "Average display update time: " << avg_display_time << " ms" << std::endl;
+        std::cout << "Average total step time: " << avg_update_time + avg_display_time << " ms" << std::endl;
+        std::cout << "Total simulation time: " << total_update_time + total_display_time << " ms" << std::endl;
+    }
+    
     return EXIT_SUCCESS;
 }
