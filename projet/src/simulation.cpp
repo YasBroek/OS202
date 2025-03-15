@@ -1,16 +1,16 @@
+#include <chrono>
+#include <mpi.h>
 #include <string>
 #include <cstdlib>
 #include <cassert>
 #include <iostream>
 #include <thread>
 #include <chrono>
-#include <numeric>
-#include <vector>
-#include <omp.h>
 
 #include "model.hpp"
 #include "display.hpp"
 
+using namespace std::chrono;
 using namespace std::string_literals;
 using namespace std::chrono_literals;
 
@@ -90,7 +90,7 @@ void analyze_arg( int nargs, char* args[], ParamsType& params )
     if (pos < key.size())
     {
         auto subkey = std::string(key, pos+7);
-        params.wind[0] = std::stoul(subkey);
+        params.wind[0] = std::stod(subkey);
         auto pos = subkey.find(",");
         if (pos == subkey.size())
         {
@@ -195,79 +195,257 @@ void display_params(ParamsType const& params)
               << "\tPosition initiale du foyer (col, ligne) : " << params.start.column << ", " << params.start.row << std::endl;
 }
 
-int main( int nargs, char* args[] )
-{
-    auto params = parse_arguments(nargs-1, &args[1]);
-    display_params(params);
-    if (!check_params(params)) return EXIT_FAILURE;
+// Processo de computação
+void computation_process(ParamsType& params) {
+    // Inicializa o modelo
+    auto simu = Model(params.length, params.discretization, params.wind, params.start);
+    bool is_running = true;
 
-    auto displayer = Displayer::init_instance( params.discretization, params.discretization );
-    auto simu = Model( params.length, params.discretization, params.wind,
-                       params.start);
-    SDL_Event event;
+    // Inicia a medição de tempo
+    auto start_time = high_resolution_clock::now();
     
-    // Timing variables
-    std::vector<double> update_times;
-    std::vector<double> display_times;
+    // Track model update times
+    double total_update_time = 0.0;
+    size_t update_count = 0;
     
-    while (true)
-    {
-        // Measure model update time
-        auto update_start = std::chrono::high_resolution_clock::now();
-        bool updated = simu.update();
-        auto update_end = std::chrono::high_resolution_clock::now();
-        
-        if (!updated) break;
-        
-        double update_duration = std::chrono::duration<double, std::milli>(update_end - update_start).count();
-        update_times.push_back(update_duration);
-        
-        if ((simu.time_step() & 31) == 0) 
-            std::cout << "Time step " << simu.time_step() << "\n===============" << std::endl;
-        
-        // Measure display update time
-        auto display_start = std::chrono::high_resolution_clock::now();
-        displayer->update( simu.vegetal_map(), simu.fire_map() );
-        auto display_end = std::chrono::high_resolution_clock::now();
-        
-        double display_duration = std::chrono::duration<double, std::milli>(display_end - display_start).count();
-        display_times.push_back(display_duration);
-        
-        // Print timing information periodically
-        if ((simu.time_step() & 31) == 0) {
-            double avg_update_time = std::accumulate(update_times.end() - std::min(static_cast<size_t>(32), update_times.size()), 
-                                                    update_times.end(), 0.0) / 
-                                    std::min(static_cast<size_t>(32), update_times.size());
+    // Get number of hardware threads available
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    std::cout << "Running with " << num_threads << " hardware threads available" << std::endl;
+
+    // Buffer para enviar/receber comandos/status
+    int command;
+    MPI_Status status;
+
+    // Variáveis para armazenar estado futuro
+    bool next_state_ready = false;
+    size_t next_time_step = 0;
+    std::vector<std::uint8_t> next_veg_map(params.discretization * params.discretization);
+    std::vector<std::uint8_t> next_fire_map(params.discretization * params.discretization);
+    
+    // Variables to track time advancement per thread
+    double total_simulation_time = 0.0;
+    double thread_advancement_rate = 0.0;
+
+    while (is_running) {
+        // Calcula o próximo estado em segundo plano
+        if (!next_state_ready) {
+            auto update_start = high_resolution_clock::now();
+            next_state_ready = simu.update();
+            auto update_end = high_resolution_clock::now();
             
-            double avg_display_time = std::accumulate(display_times.end() - std::min(static_cast<size_t>(32), display_times.size()), 
-                                                     display_times.end(), 0.0) / 
-                                     std::min(static_cast<size_t>(32), display_times.size());
+            // Calculate and accumulate the update time
+            std::chrono::duration<double, std::milli> update_duration = update_end - update_start;
+            total_update_time += update_duration.count();
+            update_count++;
             
-            std::cout << "Average update time: " << avg_update_time << " ms" << std::endl;
-            std::cout << "Average display time: " << avg_display_time << " ms" << std::endl;
-            std::cout << "Total step time: " << avg_update_time + avg_display_time << " ms" << std::endl;
+            next_time_step = simu.time_step();
+            next_veg_map = simu.vegetal_map();
+            next_fire_map = simu.fire_map();
         }
-        
-        if (SDL_PollEvent(&event) && event.type == SDL_QUIT)
+
+        // Espera pelo comando do processo de exibição
+        MPI_Recv(&command, 1, MPI_INT, 1, 0, MPI_COMM_WORLD, &status);
+
+        if (command == 0) { // Comando para sair
+            std::cout << "Computation process: Received exit command\n";
             break;
-        //std::this_thread::sleep_for(0.1s);
+        }
+
+        // Envia o estado atual para o display
+        int status_running = next_state_ready ? 1 : 0;
+        MPI_Send(&status_running, 1, MPI_INT, 1, 0, MPI_COMM_WORLD);
+
+        if (!next_state_ready) {
+            std::cout << "Computation process: Simulation naturally completed\n";
+            MPI_Recv(&command, 1, MPI_INT, 1, 0, MPI_COMM_WORLD, &status);
+            if (command == 0) {
+                std::cout << "Computation process: Final confirmation received\n";
+            }
+            break;
+        }
+
+        // Envia o estado atual para o display
+        MPI_Send(&next_time_step, 1, MPI_UNSIGNED_LONG, 1, 0, MPI_COMM_WORLD);
+        MPI_Send(next_veg_map.data(), next_veg_map.size(), MPI_UINT8_T, 1, 0, MPI_COMM_WORLD);
+        MPI_Send(next_fire_map.data(), next_fire_map.size(), MPI_UINT8_T, 1, 0, MPI_COMM_WORLD);
+
+        // Libera o estado futuro para cálculo
+        next_state_ready = false;
+
+        // Imprime informações de progresso
+        if ((next_time_step & 31) == 0)
+            std::cout << "Time step " << next_time_step << "\n===============" << std::endl;
+    }
+
+    // Registra o tempo final e imprime estatísticas
+    auto end_time = high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration = end_time - start_time;
+    total_simulation_time = duration.count();
+    
+    std::cout << "Simulation time: " << total_simulation_time << " ms\n";
+    std::cout << "Avg time per iteration: " << (total_simulation_time / simu.time_step()) << " ms\n";
+    
+    // Display the average model update time
+    if (update_count > 0) {
+        double avg_update_time = total_update_time / update_count;
+        std::cout << "Avg model update time: " << avg_update_time << " ms\n";
+        
+        // Calculate thread advancement metrics
+        if (num_threads > 0) {
+            thread_advancement_rate = (simu.time_step() / total_simulation_time) * 1000.0; // time steps per second
+            double per_thread_advancement = thread_advancement_rate / num_threads;
+            std::cout << "Time advancement rate: " << thread_advancement_rate << " steps/second\n";
+            std::cout << "Time advancement per thread: " << per_thread_advancement << " steps/second/thread\n";
+            
+            // Calculate theoretical speedup efficiency
+            double ideal_time = total_update_time / num_threads;
+            double speedup = total_update_time / avg_update_time;
+            double efficiency = speedup / num_threads * 100.0;
+            std::cout << "Parallel efficiency: " << efficiency << "%\n";
+            
+            // Interpret the results
+            std::cout << "\nPerformance Analysis:\n";
+            std::cout << "====================\n";
+            if (efficiency > 90.0) {
+                std::cout << "Excellent scaling efficiency. The simulation is taking full advantage of all threads.\n";
+            } else if (efficiency > 70.0) {
+                std::cout << "Good scaling efficiency. The simulation is benefiting well from parallelization.\n";
+            } else if (efficiency > 50.0) {
+                std::cout << "Moderate scaling efficiency. Some parallel overhead or load imbalance may be present.\n";
+            } else {
+                std::cout << "Poor scaling efficiency. The simulation may be limited by sequential bottlenecks,\n";
+                std::cout << "communication overhead, or memory bandwidth constraints.\n";
+            }
+            
+            // Analyze the relationship between model update time and overall simulation time
+            double update_portion = total_update_time / total_simulation_time * 100.0;
+            std::cout << "\nModel updates account for " << update_portion << "% of total simulation time.\n";
+            if (update_portion < 50.0) {
+                std::cout << "Most time is spent on communication or display. Improving model parallelization\n";
+                std::cout << "may have limited impact on overall performance.\n";
+            } else {
+                std::cout << "Model computation dominates simulation time. Optimizing model parallelization\n";
+                std::cout << "should yield significant overall performance improvements.\n";
+            }
+        }
+    } else {
+        std::cout << "No model updates performed\n";
     }
     
-    // Calculate and display final statistics
-    if (!update_times.empty() && !display_times.empty()) {
-        double total_update_time = std::accumulate(update_times.begin(), update_times.end(), 0.0);
-        double total_display_time = std::accumulate(display_times.begin(), display_times.end(), 0.0);
-        
-        double avg_update_time = total_update_time / update_times.size();
-        double avg_display_time = total_display_time / display_times.size();
-        
-        std::cout << "\n===== FINAL TIMING STATISTICS =====" << std::endl;
-        std::cout << "Total time steps: " << update_times.size() << std::endl;
-        std::cout << "Average model update time: " << avg_update_time << " ms" << std::endl;
-        std::cout << "Average display update time: " << avg_display_time << " ms" << std::endl;
-        std::cout << "Average total step time: " << avg_update_time + avg_display_time << " ms" << std::endl;
-        std::cout << "Total simulation time: " << total_update_time + total_display_time << " ms" << std::endl;
+    std::cout << "Computation process completed successfully\n";
+}
+
+// Processo de exibição
+void display_process(ParamsType& params) {
+    // Inicializa o displayer
+    auto displayer = Displayer::init_instance(params.discretization, params.discretization);
+
+    // Variáveis para receber o estado da simulação
+    bool is_running = true;
+    size_t time_step;
+    std::vector<std::uint8_t> vegetation_map(params.discretization * params.discretization);
+    std::vector<std::uint8_t> fire_map(params.discretization * params.discretization);
+
+    // Para eventos SDL
+    SDL_Event event;
+
+    // Buffer para comandos/status
+    int command;
+    int status_running;
+    MPI_Status mpi_status;
+
+    while (true) {
+        // Processa eventos SDL
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) {
+                std::cout << "Display process: User closed window\n";
+                command = 0;
+                MPI_Send(&command, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+                displayer.reset();
+                SDL_Quit();
+                std::cout << "Display process completed successfully\n";
+                return;
+            }
+        }
+
+        // Solicita a próxima atualização da simulação
+        command = 1;
+        MPI_Send(&command, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+
+        // Recebe o status da simulação
+        MPI_Recv(&status_running, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, &mpi_status);
+        is_running = (status_running == 1);
+
+        if (!is_running) {
+            std::cout << "Display process: Simulation has ended\n";
+            std::this_thread::sleep_for(2s);
+            displayer.reset();
+            SDL_Quit();
+            command = 0;
+            MPI_Send(&command, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+            std::cout << "Display process completed successfully\n";
+            return;
+        }
+
+        // Recebe o passo de tempo
+        MPI_Recv(&time_step, 1, MPI_UNSIGNED_LONG, 0, 0, MPI_COMM_WORLD, &mpi_status);
+
+        // Recebe o mapa de vegetação
+        MPI_Recv(vegetation_map.data(), vegetation_map.size(), MPI_UINT8_T, 0, 0, MPI_COMM_WORLD, &mpi_status);
+
+        // Recebe o mapa de fogo
+        MPI_Recv(fire_map.data(), fire_map.size(), MPI_UINT8_T, 0, 0, MPI_COMM_WORLD, &mpi_status);
+
+        // Atualiza a exibição
+        displayer->update(vegetation_map, fire_map);
     }
-    
+}
+
+int main(int nargs, char* args[]) {
+    // Inicializa MPI
+    int rank, size;
+    MPI_Init(&nargs, &args);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Verifica se há exatamente 2 processos
+    if (size != 2) {
+        if (rank == 0) {
+            std::cerr << "This program requires exactly 2 MPI processes.\n";
+        }
+        MPI_Finalize();
+        return EXIT_FAILURE;
+    }
+
+    // Parseia os argumentos da linha de comando
+    auto params = parse_arguments(nargs - 1, &args[1]);
+
+    // Cada processo exibe os parâmetros
+    if (rank == 0) {
+        std::cout << "Process " << rank << " (Computation): ";
+        display_params(params);
+    } else {
+        std::cout << "Process " << rank << " (Display): ";
+        display_params(params);
+    }
+
+    // Valida os parâmetros
+    if (!check_params(params)) {
+        MPI_Finalize();
+        return EXIT_FAILURE;
+    }
+
+    // Executa o processo correspondente
+    if (rank == 0) {
+        computation_process(params);
+    } else {
+        display_process(params);
+    }
+
+    // Finaliza MPI
+    std::cout << "Process " << rank << " finalizing MPI\n";
+    MPI_Finalize();
+    std::cout << "Process " << rank << " completed\n";
+
     return EXIT_SUCCESS;
 }

@@ -82,120 +82,111 @@ Model::update()
         clefs.push_back(f.first);
     }
 
-    int num_threads = 4;
-
-    std::vector<std::unordered_map<size_t, unsigned char>> thread_updates;
+    int num_threads = 8;
+    std::vector<std::unordered_map<size_t, std::uint8_t>> thread_updates(num_threads);
 
     #pragma omp parallel num_threads(num_threads)
     {
-        #pragma omp single
-        {
-            thread_updates.resize(omp_get_num_threads());
-            for (auto& map : thread_updates) {
-                map.reserve(clefs.size() / num_threads * 2);
-            }
-        }
+        int thread_id = omp_get_thread_num();
+        auto& updates = thread_updates[thread_id];
+        updates.reserve(clefs.size() / num_threads * 2);
 
         #pragma omp for schedule(dynamic, 64)
         for (size_t i = 0; i < clefs.size(); i++)
         {
             size_t key = clefs[i];
+
             // Récupération de la coordonnée lexicographique de la case en feu :
             LexicoIndices coord = get_lexicographic_from_index(key);
             // Et de la puissance du foyer
-            double        power = log_factor(m_fire_front[key]);
-
-            int thread_id = omp_get_thread_num();
-
+            double power = log_factor(m_fire_front[key]);
 
             // On va tester les cases voisines pour contamination par le feu :
             if (coord.row < m_geometry-1)
             {
-                double tirage      = pseudo_random( key+m_time_step, m_time_step);
+                double tirage = pseudo_random( key+m_time_step, m_time_step);
                 double green_power = m_vegetation_map[key+m_geometry];
-                double correction  = power*log_factor(green_power);
-                if (tirage < alphaSouthNorth*p1*correction)
+                double correction = power * log_factor(green_power);
+                if (tirage < alphaSouthNorth * p1 * correction)
                 {
-                    m_fire_map[key + m_geometry]   = 255.;
-                    thread_updates[thread_id][key + m_geometry] = 255.;
+                    updates[key + m_geometry] = 255;
                 }
             }
 
             if (coord.row > 0)
             {
-                double tirage      = pseudo_random( key*13427+m_time_step, m_time_step);
+                double tirage = pseudo_random( key*13427+m_time_step, m_time_step);
                 double green_power = m_vegetation_map[key - m_geometry];
-                double correction  = power*log_factor(green_power);
-                if (tirage < alphaNorthSouth*p1*correction)
+                double correction = power * log_factor(green_power);
+                if (tirage < alphaNorthSouth * p1 * correction)
                 {
-                    m_fire_map[key - m_geometry] = 255.;
-                    thread_updates[thread_id][key - m_geometry] = 255.;
+                    updates[key - m_geometry] = 255;
                 }
             }
 
             if (coord.column < m_geometry-1)
             {
-                double tirage      = pseudo_random( key*13427*13427+m_time_step, m_time_step);
+                double tirage = pseudo_random( key*13427*13427+m_time_step, m_time_step);
                 double green_power = m_vegetation_map[key+1];
-                double correction  = power*log_factor(green_power);
-                if (tirage < alphaEastWest*p1*correction)
+                double correction = power * log_factor(green_power);
+                if (tirage < alphaEastWest * p1 * correction)
                 {
-                    m_fire_map[key + 1] = 255.;
-                    thread_updates[thread_id][key + 1] = 255.;
+                    updates[key + 1] = 255;
                 }
             }
 
             if (coord.column > 0)
             {
-                double tirage      = pseudo_random( key*13427*13427*13427+m_time_step, m_time_step);
+                double tirage = pseudo_random( key*13427*13427*13427+m_time_step, m_time_step);
                 double green_power = m_vegetation_map[key - 1];
-                double correction  = power*log_factor(green_power);
-                if (tirage < alphaWestEast*p1*correction)
+                double correction = power * log_factor(green_power);
+                if (tirage < alphaWestEast * p1 * correction)
                 {
-                    m_fire_map[key - 1] = 255.;
-                    thread_updates[thread_id][key - 1] = 255.;
+                    updates[key - 1] = 255;
                 }
             }
-        
             // Si le feu est à son max,
             if (m_fire_front[key] == 255)
             {   // On regarde si il commence à faiblir pour s'éteindre au bout d'un moment :
                 double tirage = pseudo_random( key * 52513 + m_time_step, m_time_step);
                 if (tirage < p2)
                 {
-                    m_fire_map[key] >>= 1;
-                    thread_updates[thread_id][key] = m_fire_front[key] >> 1;
+                    updates[key] = m_fire_front[key] >> 1;
                 }
             }
             else
             {
                 // Foyer en train de s'éteindre.
-                m_fire_map[key] >>= 1;
-                thread_updates[thread_id][key] = m_fire_front[key] >> 1;
+                updates[key] = m_fire_front[key] >> 1;
             }
-
         }
     }    
 
-    for (auto& updates : thread_updates) {
-        for (auto& [key, value] : updates) {
+    for (const auto& updates : thread_updates)
+    {
+        for (const auto& [key, value] : updates)
+        {
             next_front[key] = value;
-            if (value == 0) {
+            if (value == 0)
+            {
                 next_front.erase(key);
             }
+            m_fire_map[key] = value;
         }
     }
 
     // A chaque itération, la végétation à l'endroit d'un foyer diminue
     m_fire_front = next_front;
-    for (auto f : m_fire_front)
+    for (const auto& f : next_front)
     {
         if (m_vegetation_map[f.first] > 0)
             m_vegetation_map[f.first] -= 1;
     }
+
     m_time_step += 1;
     return !m_fire_front.empty();
 }
+
 // ====================================================================================================================
 std::size_t   
 Model::get_index_from_lexicographic_indices( LexicoIndices t_lexico_indices  ) const

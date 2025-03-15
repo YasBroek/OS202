@@ -2,12 +2,21 @@ include Make_linux.inc
 #include Make_msys2.inc
 #include Make_osx.inc
 
-CXXFLAGS = -std=c++17 -Wall
+
+CXX = mpic++
+
+CXXFLAGS = -std=c++17 -Wall -fopenmp
 ifdef DEBUG
 CXXFLAGS += -g -O0 -fbounds-check -pedantic -D_GLIBCXX_DEBUG -fsanitize=address
 else
 CXXFLAGS += -O3 -march=native
 endif
+
+# Adicionar diretório de inclusão da SDL2 (se necessário)
+CXXFLAGS += -I/usr/include/SDL2
+
+# Adicionar a biblioteca SDL2 ao link (junto com -lmpi)
+LIB += -lmpi -lSDL2
 
 ALL= simulation.exe 
 
